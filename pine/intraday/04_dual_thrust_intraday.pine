@@ -1,0 +1,226 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Port of strategies/Dual-Thrust-MyLanguage-version.md (Michael Chalek's Dual Thrust)
+// to Pine Script v6 for CME futures intraday: CL, GC, NQ, ES (5-15 minute bars).
+//
+// Rules: Range = max(HH - LC, HC - LL) over the previous N daily bars. Upper = today's open + K1 x Range,
+// Lower = today's open - K2 x Range. Price through Upper = long, through Lower = short (stop-and-reverse).
+//
+// Fixes / changes vs. the original (which relied on FMZ evaluating the live price inside a daily bar):
+//  - Runs on an intraday chart. Prior-days' range comes from daily bars via the non-repainting
+//    `request.security(..., expr[1], lookahead_on)` idiom, so backtest and live values match.
+//  - Triggers are resting stop orders at the bands, so fills happen at the band (plus slippage) intrabar
+//    instead of at a bar close.
+//  - Intraday only: entries in a time window, a cap on entries (reversals) per day, flatten before the close.
+//  - A protective stop is always live: the opposite band (or an optional tighter hard stop) once no
+//    reversal entry is available to do that job.
+//  - Anchor choice: the RTH open (09:30 ET, default for index futures) or the Globex daily open.
+
+//@version=6
+strategy(
+     "Dual Thrust Intraday [CME futures]",
+     shorttitle              = "Dual Thrust",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.5,
+     slippage                = 1,
+     // Futures margin is not modelled by the broker emulator; v6 defaults (100%) would trigger false margin calls.
+     margin_long             = 0,
+     margin_short            = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false)
+
+// ————— Constants
+const string TZ            = "America/New_York"
+const string ANCHOR_RTH    = "Session open at anchor time"
+const string ANCHOR_GLOBEX = "Daily bar open (Globex)"
+const string SIZE_FIXED    = "Fixed contracts"
+const string SIZE_RISK     = "Risk per trade ($)"
+const string ID_LONG       = "DT L"
+const string ID_SHORT      = "DT S"
+const string ID_LONG_X     = "DT L exit"
+const string ID_SHORT_X    = "DT S exit"
+
+const string GRP_SESSION   = "Session (New York time)"
+const string GRP_SIGNAL    = "Dual Thrust"
+const string GRP_RISK      = "Risk"
+const string GRP_SIZE      = "Position sizing"
+const string GRP_VISUAL    = "Visuals"
+
+const string TT_ANCHOR = "Session open = the open of the first bar at/after the anchor time (09:30 ET for index futures; try 09:00 for CL, 08:20 for GC). Daily bar open = the Globex session open (18:00 ET the prior evening). Either way, entries start at the anchor time."
+const string TT_MAXENT = "Entries allowed per day, counting reversals. 1 = no reversal (the opposite band becomes the stop). 2 = one stop-and-reverse."
+const string TT_HARD   = "Optional hard stop at entry -/+ this multiple of the Dual Thrust range. Used when tighter than the opposite band. 0 = off."
+const string TT_RISK   = "Risk mode: contracts = floor(risk $ / (band-to-band distance x point value)), capped by Max contracts."
+
+// ————— Inputs
+int    anchorHourInput     = input.int(9,  "Anchor time",  minval = 0, maxval = 23, inline = "anc",  group = GRP_SESSION)
+int    anchorMinuteInput   = input.int(30, ":",            minval = 0, maxval = 59, inline = "anc",  group = GRP_SESSION)
+int    entryEndHourInput   = input.int(15, "Last entry",   minval = 0, maxval = 23, inline = "ee",   group = GRP_SESSION)
+int    entryEndMinuteInput = input.int(30, ":",            minval = 0, maxval = 59, inline = "ee",   group = GRP_SESSION)
+int    flatHourInput       = input.int(15, "Flatten at",   minval = 0, maxval = 23, inline = "flat", group = GRP_SESSION)
+int    flatMinuteInput     = input.int(55, ":",            minval = 0, maxval = 59, inline = "flat", group = GRP_SESSION)
+int    maxEntriesInput     = input.int(2, "Max entries per day", minval = 1, maxval = 10, tooltip = TT_MAXENT, group = GRP_SESSION)
+
+string anchorModeInput     = input.string(ANCHOR_RTH, "Open anchor", options = [ANCHOR_RTH, ANCHOR_GLOBEX], tooltip = TT_ANCHOR, group = GRP_SIGNAL)
+int    lookbackInput       = input.int(4, "N (days)", minval = 1, maxval = 50, group = GRP_SIGNAL)
+float  k1Input             = input.float(0.5, "K1 (upper)", minval = 0.05, step = 0.05, inline = "k", group = GRP_SIGNAL)
+float  k2Input             = input.float(0.5, "K2 (lower)", minval = 0.05, step = 0.05, inline = "k", group = GRP_SIGNAL)
+bool   longsInput          = input.bool(true, "Longs",  inline = "dir", group = GRP_SIGNAL)
+bool   shortsInput         = input.bool(true, "Shorts", inline = "dir", group = GRP_SIGNAL)
+
+float  hardStopMultInput   = input.float(0.0, "Hard stop (x range, 0 = off)", minval = 0.0, step = 0.05, tooltip = TT_HARD, group = GRP_RISK)
+
+string sizingModeInput     = input.string(SIZE_FIXED, "Sizing", options = [SIZE_FIXED, SIZE_RISK], tooltip = TT_RISK, group = GRP_SIZE)
+int    fixedQtyInput       = input.int(1, "Fixed contracts", minval = 1, group = GRP_SIZE)
+float  riskUsdInput        = input.float(1000.0, "Risk per trade ($)", minval = 1.0, group = GRP_SIZE)
+int    maxQtyInput         = input.int(10, "Max contracts", minval = 1, group = GRP_SIZE)
+
+bool   showLevelsInput     = input.bool(true, "Show bands", group = GRP_VISUAL)
+
+// ————— Functions
+//@function Returns the UNIX time of `hh:mm` New York time on the current bar's New York calendar date.
+//@param hh (simple int) Hour, 0-23.
+//@param mm (simple int) Minute, 0-59.
+//@returns (int) Timestamp in milliseconds.
+todayAt(simple int hh, simple int mm) =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), hh, mm, 0)
+
+//@function Contracts to trade when the stop is `stopDistance` price units away from the entry.
+//@param stopDistance (float) Entry-to-stop distance in price units.
+//@returns (float) Whole contracts, capped by `maxQtyInput`; 0 when the risk budget cannot afford one contract.
+//Dependencies: sizingModeInput, fixedQtyInput, riskUsdInput, maxQtyInput.
+contractsFor(float stopDistance) =>
+    float qty = switch sizingModeInput
+        SIZE_FIXED => float(fixedQtyInput)
+        =>            stopDistance > 0 ? math.floor(riskUsdInput / (stopDistance * syminfo.pointvalue)) : 0.0
+    math.min(qty, maxQtyInput)
+
+//@function Combines the opposite-band stop and the optional hard stop into the live protective stop.
+//@param band (float) Opposite-band stop, or na while a reversal entry is still available.
+//@param hard (float) Hard stop, or na when disabled.
+//@param isLong (bool) Direction of the position being protected.
+//@returns (float) The tighter of the two available stops, or na if neither applies.
+protectiveStop(float band, float hard, bool isLong) =>
+    float result = na
+    if na(band)
+        result := hard
+    else if na(hard)
+        result := band
+    else
+        result := isLong ? math.max(band, hard) : math.min(band, hard)
+    result
+
+// ————— Guards
+if barstate.isfirst and not timeframe.isintraday
+    runtime.error("Dual Thrust runs on an intraday chart (5-15 minute bars recommended).")
+
+// ————— Daily range (prior N completed daily bars; non-repainting)
+[hh, hc, lc, ll, dailyOpen] = request.security(syminfo.tickerid, "D",
+     [ta.highest(high, lookbackInput)[1], ta.highest(close, lookbackInput)[1], ta.lowest(close, lookbackInput)[1],
+      ta.lowest(low, lookbackInput)[1], open], lookahead = barmerge.lookahead_on)
+// Note: the current daily bar's `open` is known from its first tick, so `lookahead_on` does not leak future data.
+float dtRange = math.max(hh - lc, hc - ll)
+
+// ————— Session clock and anchor
+int  anchorTs    = todayAt(anchorHourInput, anchorMinuteInput)
+int  entryEndTs  = todayAt(entryEndHourInput, entryEndMinuteInput)
+int  flatTs      = todayAt(flatHourInput, flatMinuteInput)
+int  barMs       = timeframe.in_seconds() * 1000
+// True from the last bar that ends at/before the flatten time: the next bar would end after it.
+bool flattenNow  = time_close + barMs > flatTs
+bool isAnchorBar = time >= anchorTs and (na(time[1]) or time[1] < anchorTs)
+
+var float sessionOpen = na
+var int   anchorDayTs = na
+if isAnchorBar
+    sessionOpen := open
+    anchorDayTs := anchorTs
+
+bool  anchorReady = anchorModeInput == ANCHOR_GLOBEX or (not na(anchorDayTs) and anchorDayTs == anchorTs)
+float anchorPrice = anchorModeInput == ANCHOR_RTH ? sessionOpen : dailyOpen
+float upperBand   = math.round_to_mintick(anchorPrice + k1Input * dtRange)
+float lowerBand   = math.round_to_mintick(anchorPrice - k2Input * dtRange)
+
+// Signals are evaluated on bar close; orders work from the next bar.
+bool inEntryTime  = time >= anchorTs and time_close < entryEndTs and not flattenNow
+
+// ————— Daily entry counter (each fill, including a reversal, counts once)
+var int entriesToday = 0
+var int counterDay   = na
+if na(counterDay) or counterDay != anchorTs
+    counterDay   := anchorTs
+    entriesToday := 0
+
+int tradeCount = strategy.closedtrades + strategy.opentrades
+if tradeCount > nz(tradeCount[1])
+    entriesToday += tradeCount - nz(tradeCount[1])
+
+bool bandsValid = anchorReady and not na(dtRange) and dtRange > 0 and not na(anchorPrice)
+bool canEnter   = bandsValid and inEntryTime and entriesToday < maxEntriesInput
+// After the next fill, will another (reversal) entry still be allowed?
+bool canReverseAfterNext = entriesToday + 1 < maxEntriesInput
+float qty       = contractsFor(upperBand - lowerBand)
+
+// ————— Entry orders (stop orders at the bands; an opposite-side fill reverses the position)
+bool armLong  = canEnter and longsInput and strategy.position_size <= 0 and qty >= 1
+bool armShort = canEnter and shortsInput and strategy.position_size >= 0 and qty >= 1
+
+if armLong
+    strategy.entry(ID_LONG, strategy.long, qty = qty, stop = upperBand,
+         alert_message = "Dual Thrust long stop " + str.tostring(upperBand))
+    // Pre-attach protection so the fill bar is covered.
+    float hard = hardStopMultInput > 0 ? math.round_to_mintick(upperBand - hardStopMultInput * dtRange) : na
+    float band = canReverseAfterNext and shortsInput ? na : lowerBand
+    float stopPrice = protectiveStop(band, hard, true)
+    if not na(stopPrice)
+        strategy.exit(ID_LONG_X, ID_LONG, stop = stopPrice, comment = "SL")
+else
+    strategy.cancel(ID_LONG)
+
+if armShort
+    strategy.entry(ID_SHORT, strategy.short, qty = qty, stop = lowerBand,
+         alert_message = "Dual Thrust short stop " + str.tostring(lowerBand))
+    float hard = hardStopMultInput > 0 ? math.round_to_mintick(lowerBand + hardStopMultInput * dtRange) : na
+    float band = canReverseAfterNext and longsInput ? na : upperBand
+    float stopPrice = protectiveStop(band, hard, false)
+    if not na(stopPrice)
+        strategy.exit(ID_SHORT_X, ID_SHORT, stop = stopPrice, comment = "SL")
+else
+    strategy.cancel(ID_SHORT)
+
+// ————— Protective stop for the open position (re-evaluated every bar)
+// While a reversal entry is armed at the opposite band, that order is the stop; otherwise the band itself
+// (or the tighter hard stop) is sent as an exit order.
+if strategy.position_size > 0
+    float hard = hardStopMultInput > 0 ?
+         math.round_to_mintick(strategy.position_avg_price - hardStopMultInput * dtRange) : na
+    float band = armShort ? na : lowerBand
+    float stopPrice = protectiveStop(band, hard, true)
+    if not na(stopPrice)
+        strategy.exit(ID_LONG_X, ID_LONG, stop = stopPrice, comment = "SL")
+    else
+        strategy.cancel(ID_LONG_X)
+else if strategy.position_size < 0
+    float hard = hardStopMultInput > 0 ?
+         math.round_to_mintick(strategy.position_avg_price + hardStopMultInput * dtRange) : na
+    float band = armLong ? na : upperBand
+    float stopPrice = protectiveStop(band, hard, false)
+    if not na(stopPrice)
+        strategy.exit(ID_SHORT_X, ID_SHORT, stop = stopPrice, comment = "SL")
+    else
+        strategy.cancel(ID_SHORT_X)
+
+// End-of-day flatten: on the last bar that ends at/before the flatten time, cancel working orders and exit at
+// the next bar's open, so the position is flat by the flatten time on any bar size.
+if flattenNow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "EOD", alert_message = "Dual Thrust end-of-day flatten")
+
+// ————— Visuals
+bool showBands = showLevelsInput and bandsValid and time >= anchorTs and time < flatTs
+plot(showBands ? upperBand : na, "Upper band", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(showBands ? lowerBand : na, "Lower band", color.new(color.maroon, 0), 2, plot.style_linebr)
+plot(showBands ? anchorPrice : na, "Anchor open", color.new(color.gray, 30), 1, plot.style_linebr)

@@ -286,6 +286,10 @@ Combine families rather than stacking correlated strategies within one:
 - Use **resting stop and limit orders**, not `if close <= stop → strategy.close`, which fills a bar late.
 - **Walk-forward test** at least 10 years per market. Treat every default parameter as unverified, because none were optimised on futures.
 
+## Pine Script v6 ports (intraday)
+
+The five intraday strategies (#3, #12, #13, #15 and #16) have been rewritten as Pine Script v6, with their known bugs fixed and settings adapted to CME futures. They are in [`pine/intraday/`](pine/intraday/README.md).
+
 ## Housekeeping note
 
 [`strategies/Keltner-Channel-Breakout-Stop-Loss-Plus-Profit-10-I.e.-Long-Term-Holding-Strategy-V23-Dev-Multi-Cycle.md`](strategies/Keltner-Channel-Breakout-Stop-Loss-Plus-Profit-10-I.e.-Long-Term-Holding-Strategy-V23-Dev-Multi-Cycle.md) contains exchange `AccessKey`/`SecretKey` values in its backtest header, carried over from the original FMZ source. They look partial and probably belong to the original author, but they should be redacted.

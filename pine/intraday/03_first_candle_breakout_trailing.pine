@@ -1,0 +1,202 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Port of strategies/First-Candle-Breakout-Dynamic-Trailing-Stop-EOD-Close-Strategy.md
+// to Pine Script v6 for CME futures: NQ / ES / RTY / YM from the 09:30 ET cash open, or CL / GC from their
+// 09:00 / 08:20 ET pit-session opens (change "First candle start").
+//
+// Rules: the first candle's high/low after the open define the levels. Trade the first break of either side
+// (one trade per day), trail a stop at N x the first candle's range, flatten before the close.
+//
+// Fixes vs. the original:
+//  - Entries are allowed as soon as the first candle closes. The original's `hour > startHour` blocked
+//    everything until the next clock hour (e.g. nothing before 10:00 with a 9:30 start).
+//  - The trailing stop is a resting stop order, live from the fill bar. The original checked `close <= stop`
+//    and exited at the next bar's open, so every stop-out slipped by a full bar.
+//  - The end-of-day exit fires on the first bar closing at/after the flatten time. The original needed a bar
+//    stamped at exactly hh:mm and otherwise held the position overnight.
+//  - New York session times (DST-safe) instead of NSE India defaults; first-candle length is independent of
+//    the chart timeframe; contract sizing, per-contract commission and slippage.
+
+//@version=6
+strategy(
+     "First Candle Breakout + Trailing Stop [CME futures]",
+     shorttitle              = "1st Candle BO",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.5,
+     slippage                = 1,
+     // Futures margin is not modelled by the broker emulator; v6 defaults (100%) would trigger false margin calls.
+     margin_long             = 0,
+     margin_short            = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false)
+
+// ————— Constants
+const string TZ           = "America/New_York"
+const int    MS_IN_MIN    = 60 * 1000
+const string SIZE_FIXED   = "Fixed contracts"
+const string SIZE_RISK    = "Risk per trade ($)"
+const string ENTRY_CLOSE  = "Close beyond candle (market)"
+const string ENTRY_STOP   = "Stop order at candle high/low"
+const string ID_LONG      = "1C L"
+const string ID_SHORT     = "1C S"
+const string ID_LONG_X    = "1C L exit"
+const string ID_SHORT_X   = "1C S exit"
+const string OCA_ENTRY    = "1C entry"
+
+const string GRP_SESSION  = "Session (New York time)"
+const string GRP_SIGNAL   = "Entries & exits"
+const string GRP_SIZE     = "Position sizing"
+const string GRP_VISUAL   = "Visuals"
+
+const string TT_ENTRY = "Close beyond candle = original rule: a bar must close outside the first candle, then enter at the next bar's open. Stop order = enter the moment price trades one tick beyond the level."
+const string TT_TRAIL = "Trailing stop distance as a multiple of the first candle's range. The stop only moves in the trade's favour, ratcheting on bar closes (original behaviour), and rests as a stop order."
+const string TT_RISK  = "Risk mode: contracts = floor(risk $ / (initial stop distance x point value)), capped by Max contracts. A signal is skipped if not even one contract fits the budget."
+
+// ————— Inputs
+int    startHourInput      = input.int(9,  "First candle start", minval = 0, maxval = 23, inline = "fc", group = GRP_SESSION)
+int    startMinuteInput    = input.int(30, ":",                  minval = 0, maxval = 59, inline = "fc", group = GRP_SESSION)
+int    candleMinutesInput  = input.int(5, "First candle length (min)", minval = 1, maxval = 240, group = GRP_SESSION)
+int    entryEndHourInput   = input.int(15, "Last entry",  minval = 0, maxval = 23, inline = "ee",   group = GRP_SESSION)
+int    entryEndMinuteInput = input.int(0,  ":",           minval = 0, maxval = 59, inline = "ee",   group = GRP_SESSION)
+int    flatHourInput       = input.int(15, "Flatten at",  minval = 0, maxval = 23, inline = "flat", group = GRP_SESSION)
+int    flatMinuteInput     = input.int(55, ":",           minval = 0, maxval = 59, inline = "flat", group = GRP_SESSION)
+
+bool   longsInput          = input.bool(true, "Longs",  inline = "dir", group = GRP_SIGNAL)
+bool   shortsInput         = input.bool(true, "Shorts", inline = "dir", group = GRP_SIGNAL)
+string entryModeInput      = input.string(ENTRY_CLOSE, "Entry", options = [ENTRY_CLOSE, ENTRY_STOP], tooltip = TT_ENTRY, group = GRP_SIGNAL)
+float  trailMultInput      = input.float(1.5, "Trailing stop (x first-candle range)", minval = 0.1, step = 0.1, tooltip = TT_TRAIL, group = GRP_SIGNAL)
+
+string sizingModeInput     = input.string(SIZE_FIXED, "Sizing", options = [SIZE_FIXED, SIZE_RISK], tooltip = TT_RISK, group = GRP_SIZE)
+int    fixedQtyInput       = input.int(1, "Fixed contracts", minval = 1, group = GRP_SIZE)
+float  riskUsdInput        = input.float(500.0, "Risk per trade ($)", minval = 1.0, group = GRP_SIZE)
+int    maxQtyInput         = input.int(10, "Max contracts", minval = 1, group = GRP_SIZE)
+
+bool   showLevelsInput     = input.bool(true, "Show first candle and trailing stop", group = GRP_VISUAL)
+
+// ————— Functions
+//@function Returns the UNIX time of `hh:mm` New York time on the current bar's New York calendar date.
+//@param hh (simple int) Hour, 0-23.
+//@param mm (simple int) Minute, 0-59.
+//@returns (int) Timestamp in milliseconds.
+todayAt(simple int hh, simple int mm) =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), hh, mm, 0)
+
+//@function Contracts to trade when the stop is `stopDistance` price units away from the entry.
+//@param stopDistance (float) Entry-to-stop distance in price units.
+//@returns (float) Whole contracts, capped by `maxQtyInput`; 0 when the risk budget cannot afford one contract.
+//Dependencies: sizingModeInput, fixedQtyInput, riskUsdInput, maxQtyInput.
+contractsFor(float stopDistance) =>
+    float qty = switch sizingModeInput
+        SIZE_FIXED => float(fixedQtyInput)
+        =>            stopDistance > 0 ? math.floor(riskUsdInput / (stopDistance * syminfo.pointvalue)) : 0.0
+    math.min(qty, maxQtyInput)
+
+// ————— Guards
+if barstate.isfirst
+    if not timeframe.isintraday
+        runtime.error("Use an intraday chart (1-5 minute bars recommended).")
+    if timeframe.in_seconds() > candleMinutesInput * 60
+        runtime.error("The chart timeframe must not be longer than the first-candle length.")
+
+// ————— Session clock
+int  candleStartTs = todayAt(startHourInput, startMinuteInput)
+int  candleEndTs   = candleStartTs + candleMinutesInput * MS_IN_MIN
+int  entryEndTs    = todayAt(entryEndHourInput, entryEndMinuteInput)
+int  flatTs        = todayAt(flatHourInput, flatMinuteInput)
+int  barMs         = timeframe.in_seconds() * 1000
+// True from the last bar that ends at/before the flatten time: the next bar would end after it.
+bool flattenNow    = time_close + barMs > flatTs
+bool isCandleBar   = time >= candleStartTs and time < candleEndTs
+bool isCandleFirst = isCandleBar and (na(time[1]) or time[1] < candleStartTs)
+bool isCandleLast  = isCandleBar and time_close >= candleEndTs
+// Signals are evaluated on bar close; the resulting orders work from the next bar.
+bool inEntryTime   = time_close >= candleEndTs and time_close < entryEndTs and not flattenNow
+
+// ————— First-candle state
+var float fcHigh    = na
+var float fcLow     = na
+var int   fcDayTs   = na      // `candleStartTs` of the day whose first candle is complete
+var bool  tradedDay = false
+
+if isCandleFirst
+    fcHigh    := high
+    fcLow     := low
+    tradedDay := false
+else if isCandleBar and not na(fcHigh)
+    fcHigh := math.max(fcHigh, high)
+    fcLow  := math.min(fcLow, low)
+
+if isCandleLast and not na(fcHigh)
+    fcDayTs := candleStartTs
+
+bool  levelsReady = not na(fcDayTs) and fcDayTs == candleStartTs
+float trailDist   = trailMultInput * (fcHigh - fcLow)
+
+int tradeCount = strategy.closedtrades + strategy.opentrades
+if tradeCount > nz(tradeCount[1])
+    tradedDay := true
+
+bool canEnter = levelsReady and inEntryTime and not tradedDay and trailDist > 0 and strategy.position_size == 0
+
+// ————— Entries
+if entryModeInput == ENTRY_CLOSE
+    // Close-confirmation mode: market order at the next open; initial stop referenced to the signal close.
+    float qty = contractsFor(trailDist)
+    bool  goLong  = canEnter and longsInput and close > fcHigh and qty >= 1
+    bool  goShort = canEnter and shortsInput and close < fcLow and qty >= 1
+    if goLong
+        strategy.entry(ID_LONG, strategy.long, qty = qty, alert_message = "First candle breakout long")
+        strategy.exit(ID_LONG_X, ID_LONG, stop = math.round_to_mintick(close - trailDist), comment = "Trail")
+    else if goShort
+        strategy.entry(ID_SHORT, strategy.short, qty = qty, alert_message = "First candle breakout short")
+        strategy.exit(ID_SHORT_X, ID_SHORT, stop = math.round_to_mintick(close + trailDist), comment = "Trail")
+else
+    // Stop-order mode: bracket both levels; the first fill cancels the other side (OCA).
+    float longEntry  = math.round_to_mintick(fcHigh + syminfo.mintick)
+    float shortEntry = math.round_to_mintick(fcLow - syminfo.mintick)
+    float qty        = contractsFor(trailDist)
+    if canEnter and qty >= 1
+        if longsInput
+            strategy.entry(ID_LONG, strategy.long, qty = qty, stop = longEntry, oca_name = OCA_ENTRY,
+                 oca_type = strategy.oca.cancel, alert_message = "First candle long stop " + str.tostring(longEntry))
+            strategy.exit(ID_LONG_X, ID_LONG, stop = math.round_to_mintick(longEntry - trailDist), comment = "Trail")
+        if shortsInput
+            strategy.entry(ID_SHORT, strategy.short, qty = qty, stop = shortEntry, oca_name = OCA_ENTRY,
+                 oca_type = strategy.oca.cancel, alert_message = "First candle short stop " + str.tostring(shortEntry))
+            strategy.exit(ID_SHORT_X, ID_SHORT, stop = math.round_to_mintick(shortEntry + trailDist), comment = "Trail")
+    else if strategy.position_size == 0
+        strategy.cancel(ID_LONG)
+        strategy.cancel(ID_SHORT)
+
+// ————— Trailing stop management
+// Ratchets on bar closes (as in the original) and is re-sent as a resting stop order each bar.
+var float trailStop = na
+if strategy.position_size > 0
+    strategy.cancel(ID_SHORT)   // do not rely on OCA alone
+    float fromFill = strategy.position_avg_price - trailDist
+    trailStop := math.round_to_mintick(math.max(nz(trailStop, fromFill), close - trailDist))
+    strategy.exit(ID_LONG_X, ID_LONG, stop = trailStop, comment = "Trail")
+else if strategy.position_size < 0
+    strategy.cancel(ID_LONG)
+    float fromFill = strategy.position_avg_price + trailDist
+    trailStop := math.round_to_mintick(math.min(nz(trailStop, fromFill), close + trailDist))
+    strategy.exit(ID_SHORT_X, ID_SHORT, stop = trailStop, comment = "Trail")
+else
+    trailStop := na
+
+// End-of-day flatten: on the last bar that ends at/before the flatten time, cancel working orders and exit at
+// the next bar's open, so the position is flat by the flatten time on any bar size.
+if flattenNow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "EOD", alert_message = "First candle end-of-day flatten")
+
+// ————— Visuals
+bool showCandle = showLevelsInput and (isCandleBar or levelsReady) and time < flatTs
+plot(showCandle ? fcHigh : na, "First candle high", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(showCandle ? fcLow : na,  "First candle low",  color.new(color.maroon, 0), 2, plot.style_linebr)
+plot(showLevelsInput ? trailStop : na, "Trailing stop", color.new(color.orange, 0), 1, plot.style_linebr)
+bgcolor(showLevelsInput and isCandleBar ? color.new(color.gray, 85) : na, title = "First candle window")

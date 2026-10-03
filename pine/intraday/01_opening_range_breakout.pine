@@ -1,0 +1,230 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Port of strategies/Dynamic-Opening-Range-Breakout-High-Frequency-Trading-Strategy.md
+// to Pine Script v6 for CME equity index futures (NQ / ES / RTY / YM, and the micros).
+//
+// Fixes vs. the original:
+//  - The take-profit is now actually placed. The original computed it from `strategy.position_avg_price`
+//    while still flat (= na), so no target order was ever sent.
+//  - Entries are resting stop orders one tick beyond the range, bracketed (OCA) so only one side can fill,
+//    and the stop/target are attached before the fill, so the fill bar is protected.
+//  - The curve-fit "skip Monday and Thursday" default is removed (all weekdays on; still configurable).
+//  - Session times are explicit New York time and DST-safe; the end-of-day exit no longer depends on a bar
+//    stamped at exactly 16:00.
+//  - Contract-based sizing (fixed or $-risk), per-contract commission and slippage, and an optional
+//    range-vs-daily-ATR filter. Dead code (`request.security(..., "1", close)`) removed.
+
+//@version=6
+strategy(
+     "Opening Range Breakout [CME index futures]",
+     shorttitle              = "ORB",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.5,
+     slippage                = 1,
+     // Futures margin is not modelled by the broker emulator; v6 defaults (100%) would trigger false margin calls.
+     margin_long             = 0,
+     margin_short            = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false)
+
+// ————— Constants
+const string TZ          = "America/New_York"
+const int    MS_IN_MIN   = 60 * 1000
+const string SIZE_FIXED  = "Fixed contracts"
+const string SIZE_RISK   = "Risk per trade ($)"
+const string STOP_MID    = "Range midpoint"
+const string STOP_OPP    = "Opposite side of range"
+const string ID_LONG     = "ORB L"
+const string ID_SHORT    = "ORB S"
+const string ID_LONG_X   = "ORB L exit"
+const string ID_SHORT_X  = "ORB S exit"
+const string OCA_ENTRY   = "ORB entry"
+
+const string GRP_SESSION = "Session (New York time)"
+const string GRP_DAYS    = "Trading days"
+const string GRP_SIGNAL  = "Entries & exits"
+const string GRP_FILTER  = "Range filter"
+const string GRP_SIZE    = "Position sizing"
+const string GRP_VISUAL  = "Visuals"
+
+const string TT_STOP   = "Range midpoint = original rule (stop at half the range). Opposite side = wider, classic ORB stop."
+const string TT_TARGET = "Take-profit as a multiple of the initial risk (entry to stop). 0 disables the target; the trade then exits at the stop or the end-of-day flatten."
+const string TT_ATR    = "Only trade when the opening range is between the min and max fraction of the prior days' daily ATR. Skips dead days and opens that already used up the day's range."
+const string TT_RISK   = "Risk mode: contracts = floor(risk $ / (stop distance x point value)), capped by Max contracts. A trade is skipped if not even one contract fits the budget."
+
+// ————— Inputs
+int    orStartHourInput    = input.int(9,  "Range start",        minval = 0, maxval = 23, inline = "or",   group = GRP_SESSION)
+int    orStartMinuteInput  = input.int(30, ":",                  minval = 0, maxval = 59, inline = "or",   group = GRP_SESSION)
+int    orMinutesInput      = input.int(15, "Range length (min)", minval = 1, maxval = 240,                 group = GRP_SESSION)
+int    entryEndHourInput   = input.int(12, "Last entry",         minval = 0, maxval = 23, inline = "ee",   group = GRP_SESSION)
+int    entryEndMinuteInput = input.int(0,  ":",                  minval = 0, maxval = 59, inline = "ee",   group = GRP_SESSION)
+int    flatHourInput       = input.int(15, "Flatten at",         minval = 0, maxval = 23, inline = "flat", group = GRP_SESSION)
+int    flatMinuteInput     = input.int(55, ":",                  minval = 0, maxval = 59, inline = "flat", group = GRP_SESSION)
+
+bool   monInput            = input.bool(true, "Mon", inline = "days", group = GRP_DAYS)
+bool   tueInput            = input.bool(true, "Tue", inline = "days", group = GRP_DAYS)
+bool   wedInput            = input.bool(true, "Wed", inline = "days", group = GRP_DAYS)
+bool   thuInput            = input.bool(true, "Thu", inline = "days", group = GRP_DAYS)
+bool   friInput            = input.bool(true, "Fri", inline = "days", group = GRP_DAYS)
+
+bool   longsInput          = input.bool(true, "Longs",  inline = "dir", group = GRP_SIGNAL)
+bool   shortsInput         = input.bool(true, "Shorts", inline = "dir", group = GRP_SIGNAL)
+int    entryOffsetInput    = input.int(1, "Entry offset beyond range (ticks)", minval = 0, group = GRP_SIGNAL)
+string stopModeInput       = input.string(STOP_MID, "Stop", options = [STOP_MID, STOP_OPP], tooltip = TT_STOP, group = GRP_SIGNAL)
+float  targetRInput        = input.float(3.0, "Target (R multiple)", minval = 0.0, step = 0.25, tooltip = TT_TARGET, group = GRP_SIGNAL)
+
+bool   atrFilterInput      = input.bool(false, "Filter range size vs daily ATR", tooltip = TT_ATR, group = GRP_FILTER)
+int    atrLengthInput      = input.int(14, "Daily ATR length", minval = 1, group = GRP_FILTER)
+float  minRangeAtrInput    = input.float(0.10, "Min range / ATR", minval = 0.0, step = 0.05, inline = "atr", group = GRP_FILTER)
+float  maxRangeAtrInput    = input.float(0.60, "Max",             minval = 0.0, step = 0.05, inline = "atr", group = GRP_FILTER)
+
+string sizingModeInput     = input.string(SIZE_FIXED, "Sizing", options = [SIZE_FIXED, SIZE_RISK], tooltip = TT_RISK, group = GRP_SIZE)
+int    fixedQtyInput       = input.int(1, "Fixed contracts", minval = 1, group = GRP_SIZE)
+float  riskUsdInput        = input.float(500.0, "Risk per trade ($)", minval = 1.0, group = GRP_SIZE)
+int    maxQtyInput         = input.int(10, "Max contracts", minval = 1, group = GRP_SIZE)
+
+bool   showLevelsInput     = input.bool(true, "Show range and trade levels", group = GRP_VISUAL)
+
+// ————— Functions
+//@function Returns the UNIX time of `hh:mm` New York time on the current bar's New York calendar date.
+//@param hh (simple int) Hour, 0-23.
+//@param mm (simple int) Minute, 0-59.
+//@returns (int) Timestamp in milliseconds.
+todayAt(simple int hh, simple int mm) =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), hh, mm, 0)
+
+//@function Contracts to trade when the stop is `stopDistance` price units away from the entry.
+//@param stopDistance (float) Entry-to-stop distance in price units.
+//@returns (float) Whole contracts, capped by `maxQtyInput`; 0 when the risk budget cannot afford one contract.
+//Dependencies: sizingModeInput, fixedQtyInput, riskUsdInput, maxQtyInput.
+contractsFor(float stopDistance) =>
+    float qty = switch sizingModeInput
+        SIZE_FIXED => float(fixedQtyInput)
+        =>            stopDistance > 0 ? math.floor(riskUsdInput / (stopDistance * syminfo.pointvalue)) : 0.0
+    math.min(qty, maxQtyInput)
+
+// ————— Guards
+if barstate.isfirst
+    if not timeframe.isintraday
+        runtime.error("Use an intraday chart (1-5 minute bars recommended).")
+    if timeframe.in_seconds() > orMinutesInput * 60
+        runtime.error("The chart timeframe must not be longer than the opening-range length.")
+
+// ————— Session clock
+int  orStartTs    = todayAt(orStartHourInput, orStartMinuteInput)
+int  orEndTs      = orStartTs + orMinutesInput * MS_IN_MIN
+int  entryEndTs   = todayAt(entryEndHourInput, entryEndMinuteInput)
+int  flatTs       = todayAt(flatHourInput, flatMinuteInput)
+int  barMs        = timeframe.in_seconds() * 1000
+// True from the last bar that ends at/before the flatten time: the next bar would end after it.
+bool flattenNow   = time_close + barMs > flatTs
+bool isOrBar      = time >= orStartTs and time < orEndTs
+bool isOrFirstBar = isOrBar and (na(time[1]) or time[1] < orStartTs)
+bool isOrLastBar  = isOrBar and time_close >= orEndTs
+// Orders sent on a bar's close work from the next bar, so arming starts on the last range bar.
+bool inEntryTime  = time_close >= orEndTs and time_close < entryEndTs and not flattenNow
+
+bool dayAllowed = switch dayofweek(time, TZ)
+    dayofweek.monday    => monInput
+    dayofweek.tuesday   => tueInput
+    dayofweek.wednesday => wedInput
+    dayofweek.thursday  => thuInput
+    dayofweek.friday    => friInput
+    =>                     false
+
+// Prior completed days' ATR: `[1]` + lookahead_on is the non-repainting HTF idiom.
+float dailyAtr = request.security(syminfo.tickerid, "D", ta.atr(atrLengthInput)[1], lookahead = barmerge.lookahead_on)
+
+// ————— Opening range state
+var float orHigh     = na
+var float orLow      = na
+var int   rangeDayTs = na      // `orStartTs` of the day whose range is complete
+var bool  tradedDay  = false   // one trade per day
+
+if isOrFirstBar
+    orHigh    := high
+    orLow     := low
+    tradedDay := false
+else if isOrBar and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+if isOrLastBar and not na(orHigh)
+    rangeDayTs := orStartTs
+
+bool  rangeReady = not na(rangeDayTs) and rangeDayTs == orStartTs
+float orRange    = orHigh - orLow
+float orMid      = math.round_to_mintick((orHigh + orLow) / 2)
+
+// Count fills (entries) so a trade that opens and closes on one bar still uses up the day.
+int tradeCount = strategy.closedtrades + strategy.opentrades
+if tradeCount > nz(tradeCount[1])
+    tradedDay := true
+
+// ————— Trade levels
+float longEntry   = math.round_to_mintick(orHigh + entryOffsetInput * syminfo.mintick)
+float shortEntry  = math.round_to_mintick(orLow - entryOffsetInput * syminfo.mintick)
+float longStop    = stopModeInput == STOP_MID ? orMid : orLow
+float shortStop   = stopModeInput == STOP_MID ? orMid : orHigh
+float longTarget  = targetRInput > 0 ? math.round_to_mintick(longEntry + targetRInput * (longEntry - longStop)) : na
+float shortTarget = targetRInput > 0 ? math.round_to_mintick(shortEntry - targetRInput * (shortStop - shortEntry)) : na
+float longQty     = contractsFor(longEntry - longStop)
+float shortQty    = contractsFor(shortStop - shortEntry)
+
+bool atrOk = not atrFilterInput or
+     (not na(dailyAtr) and orRange >= minRangeAtrInput * dailyAtr and orRange <= maxRangeAtrInput * dailyAtr)
+
+bool canArm = rangeReady and inEntryTime and dayAllowed and atrOk and not tradedDay and orRange > 0 and
+     strategy.position_size == 0
+
+// ————— Orders
+if canArm
+    if longsInput and longQty >= 1
+        strategy.entry(ID_LONG, strategy.long, qty = longQty, stop = longEntry, oca_name = OCA_ENTRY,
+             oca_type = strategy.oca.cancel, alert_message = "ORB long stop " + str.tostring(longEntry))
+        strategy.exit(ID_LONG_X, ID_LONG, stop = longStop, limit = longTarget, comment_loss = "SL",
+             comment_profit = "TP")
+    else
+        strategy.cancel(ID_LONG)
+    if shortsInput and shortQty >= 1
+        strategy.entry(ID_SHORT, strategy.short, qty = shortQty, stop = shortEntry, oca_name = OCA_ENTRY,
+             oca_type = strategy.oca.cancel, alert_message = "ORB short stop " + str.tostring(shortEntry))
+        strategy.exit(ID_SHORT_X, ID_SHORT, stop = shortStop, limit = shortTarget, comment_loss = "SL",
+             comment_profit = "TP")
+    else
+        strategy.cancel(ID_SHORT)
+else if strategy.position_size == 0
+    strategy.cancel(ID_LONG)
+    strategy.cancel(ID_SHORT)
+
+// In a position: cancel the opposite entry explicitly (do not rely on OCA alone) and keep the bracket working.
+if strategy.position_size > 0
+    strategy.cancel(ID_SHORT)
+    strategy.exit(ID_LONG_X, ID_LONG, stop = longStop, limit = longTarget, comment_loss = "SL", comment_profit = "TP")
+else if strategy.position_size < 0
+    strategy.cancel(ID_LONG)
+    strategy.exit(ID_SHORT_X, ID_SHORT, stop = shortStop, limit = shortTarget, comment_loss = "SL",
+         comment_profit = "TP")
+
+// End-of-day flatten: on the last bar that ends at/before the flatten time, cancel working orders and exit at
+// the next bar's open, so the position is flat by the flatten time on any bar size.
+if flattenNow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "EOD", alert_message = "ORB end-of-day flatten")
+
+// ————— Visuals
+bool  showRange = showLevelsInput and (isOrBar or rangeReady) and time < flatTs
+bool  isLong    = strategy.position_size > 0
+bool  isShort   = strategy.position_size < 0
+float stopPlot  = showLevelsInput ? (isLong ? longStop : isShort ? shortStop : na) : na
+float tgtPlot   = showLevelsInput ? (isLong ? longTarget : isShort ? shortTarget : na) : na
+
+plot(showRange ? orHigh : na, "Range high", color.new(color.teal, 0), 2, plot.style_linebr)
+plot(showRange ? orLow : na,  "Range low",  color.new(color.maroon, 0), 2, plot.style_linebr)
+plot(stopPlot, "Stop",   color.new(color.red, 0),   1, plot.style_linebr)
+plot(tgtPlot,  "Target", color.new(color.green, 0), 1, plot.style_linebr)
+bgcolor(showLevelsInput and isOrBar ? color.new(color.gray, 85) : na, title = "Opening range window")

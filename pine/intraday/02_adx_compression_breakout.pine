@@ -1,0 +1,199 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Port of strategies/ADX-Trend-Breakout-Momentum-Trading-Strategy.md
+// to Pine Script v6 for CME equity index futures (NQ / ES, 30-minute bars by default).
+//
+// Idea: a new N-bar closing high while ADX is low (trendless, compressed market) often starts a move.
+// Enter with a buy-stop one tick above the signal close.
+//
+// Fixes vs. the original:
+//  - The protective stop is attached as a tick distance from the actual fill (`loss`), so it is live on the
+//    fill bar. The original only sent the stop on the bar after the fill.
+//  - The daily trade cap counts fills, not order submissions.
+//  - Unfilled stop entries are cancelled after one bar instead of resting indefinitely.
+//  - Session times are explicit New York time (DST-safe). The original "0730-1430" exchange-time session
+//    stopped 30 minutes before the cash close; the window now runs to 15:30 ET and flattens at 15:55 ET.
+//  - Optional profit target (R multiple), optional ATR-based stop, optional mirrored short side.
+
+//@version=6
+strategy(
+     "ADX Compression Breakout [CME index futures]",
+     shorttitle              = "ADX BO",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.5,
+     slippage                = 1,
+     // Futures margin is not modelled by the broker emulator; v6 defaults (100%) would trigger false margin calls.
+     margin_long             = 0,
+     margin_short            = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false)
+
+// ————— Constants
+const string TZ          = "America/New_York"
+const string SIZE_FIXED  = "Fixed contracts"
+const string SIZE_RISK   = "Risk per trade ($)"
+const string STOP_USD    = "$ per contract"
+const string STOP_ATR    = "ATR multiple"
+const string ID_LONG     = "ADX L"
+const string ID_SHORT    = "ADX S"
+const string ID_LONG_X   = "ADX L exit"
+const string ID_SHORT_X  = "ADX S exit"
+
+const string GRP_SESSION = "Session (New York time)"
+const string GRP_SIGNAL  = "Signal"
+const string GRP_EXIT    = "Exits"
+const string GRP_SIZE    = "Position sizing"
+const string GRP_VISUAL  = "Visuals"
+
+const string TT_ADX    = "Entries require ADX below this level (a quiet, non-trending market) when the breakout happens."
+const string TT_STOP   = "$ per contract = original rule ($1,000 on NQ/ES). ATR multiple scales the stop to the chart timeframe's ATR, which ports better across contracts."
+const string TT_TARGET = "Take-profit as a multiple of the stop distance. 0 = no target (original): exits are the stop or the end-of-day flatten."
+const string TT_RISK   = "Risk mode: contracts = floor(risk $ / (stop distance x point value)), capped by Max contracts. A signal is skipped if not even one contract fits the budget."
+
+// ————— Inputs
+int    startHourInput      = input.int(9,  "Entries from", minval = 0, maxval = 23, inline = "start", group = GRP_SESSION)
+int    startMinuteInput    = input.int(30, ":",            minval = 0, maxval = 59, inline = "start", group = GRP_SESSION)
+int    endHourInput        = input.int(15, "Entries until", minval = 0, maxval = 23, inline = "end",  group = GRP_SESSION)
+int    endMinuteInput      = input.int(30, ":",             minval = 0, maxval = 59, inline = "end",  group = GRP_SESSION)
+int    flatHourInput       = input.int(15, "Flatten at",    minval = 0, maxval = 23, inline = "flat", group = GRP_SESSION)
+int    flatMinuteInput     = input.int(55, ":",             minval = 0, maxval = 59, inline = "flat", group = GRP_SESSION)
+int    maxTradesInput      = input.int(3, "Max trades per day", minval = 1, group = GRP_SESSION)
+
+int    breakoutLenInput    = input.int(34, "Breakout lookback (bars)", minval = 2, group = GRP_SIGNAL)
+int    diLengthInput       = input.int(50, "DI length", minval = 1, group = GRP_SIGNAL)
+int    adxSmoothingInput   = input.int(14, "ADX smoothing", minval = 1, group = GRP_SIGNAL)
+float  adxMaxInput         = input.float(17.5, "Max ADX", minval = 0.0, step = 0.5, tooltip = TT_ADX, group = GRP_SIGNAL)
+bool   longsInput          = input.bool(true,  "Longs",  inline = "dir", group = GRP_SIGNAL)
+bool   shortsInput         = input.bool(false, "Shorts (mirror)", inline = "dir", group = GRP_SIGNAL)
+
+string stopModeInput       = input.string(STOP_USD, "Stop", options = [STOP_USD, STOP_ATR], tooltip = TT_STOP, group = GRP_EXIT)
+float  stopUsdInput        = input.float(1000.0, "Stop ($ per contract)", minval = 1.0, group = GRP_EXIT)
+int    atrLengthInput      = input.int(14, "ATR length", minval = 1, inline = "atr", group = GRP_EXIT)
+float  atrMultInput        = input.float(2.0, "x", minval = 0.1, step = 0.1, inline = "atr", group = GRP_EXIT)
+float  targetRInput        = input.float(0.0, "Target (R multiple)", minval = 0.0, step = 0.25, tooltip = TT_TARGET, group = GRP_EXIT)
+
+string sizingModeInput     = input.string(SIZE_FIXED, "Sizing", options = [SIZE_FIXED, SIZE_RISK], tooltip = TT_RISK, group = GRP_SIZE)
+int    fixedQtyInput       = input.int(1, "Fixed contracts", minval = 1, group = GRP_SIZE)
+float  riskUsdInput        = input.float(1000.0, "Risk per trade ($)", minval = 1.0, group = GRP_SIZE)
+int    maxQtyInput         = input.int(10, "Max contracts", minval = 1, group = GRP_SIZE)
+
+bool   showLevelsInput     = input.bool(true, "Show breakout and stop levels", group = GRP_VISUAL)
+
+// ————— Functions
+//@function Returns the UNIX time of `hh:mm` New York time on the current bar's New York calendar date.
+//@param hh (simple int) Hour, 0-23.
+//@param mm (simple int) Minute, 0-59.
+//@returns (int) Timestamp in milliseconds.
+todayAt(simple int hh, simple int mm) =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), hh, mm, 0)
+
+//@function Contracts to trade when the stop is `stopDistance` price units away from the entry.
+//@param stopDistance (float) Entry-to-stop distance in price units.
+//@returns (float) Whole contracts, capped by `maxQtyInput`; 0 when the risk budget cannot afford one contract.
+//Dependencies: sizingModeInput, fixedQtyInput, riskUsdInput, maxQtyInput.
+contractsFor(float stopDistance) =>
+    float qty = switch sizingModeInput
+        SIZE_FIXED => float(fixedQtyInput)
+        =>            stopDistance > 0 ? math.floor(riskUsdInput / (stopDistance * syminfo.pointvalue)) : 0.0
+    math.min(qty, maxQtyInput)
+
+// ————— Guards
+if barstate.isfirst and not timeframe.isintraday
+    runtime.error("Use an intraday chart (30-minute bars match the original).")
+
+// ————— Session clock
+int  startTs     = todayAt(startHourInput, startMinuteInput)
+int  endTs       = todayAt(endHourInput, endMinuteInput)
+int  flatTs      = todayAt(flatHourInput, flatMinuteInput)
+int  barMs       = timeframe.in_seconds() * 1000
+// True from the last bar that ends at/before the flatten time: the next bar would end after it.
+bool flattenNow  = time_close + barMs > flatTs
+// A stop order sent on this bar's close can fill during the next bar, so the bar must close inside the window.
+bool inEntryTime = time >= startTs and time_close <= endTs and not flattenNow
+
+// ————— Indicators (global scope so their history has no gaps)
+[diPlus, diMinus, adxValue] = ta.dmi(diLengthInput, adxSmoothingInput)
+float priorHighClose = ta.highest(close, breakoutLenInput)[1]
+float priorLowClose  = ta.lowest(close, breakoutLenInput)[1]
+float atrValue       = ta.atr(atrLengthInput)
+
+bool compressed  = adxValue < adxMaxInput
+bool longSignal  = longsInput and compressed and close >= priorHighClose
+bool shortSignal = shortsInput and compressed and close <= priorLowClose
+
+// ————— Daily trade counter (fills, not orders)
+var int tradesToday = 0
+var int counterDay  = na
+if (na(counterDay) or counterDay != startTs) and time >= startTs
+    counterDay  := startTs
+    tradesToday := 0
+
+int tradeCount = strategy.closedtrades + strategy.opentrades
+if tradeCount > nz(tradeCount[1])
+    tradesToday += tradeCount - nz(tradeCount[1])
+
+// ————— Risk
+float stopDistance = stopModeInput == STOP_USD ? stopUsdInput / syminfo.pointvalue : atrMultInput * atrValue
+int   stopTicks    = math.max(1, int(math.round(stopDistance / syminfo.mintick)))
+float targetTicks  = targetRInput > 0 ? math.round(stopTicks * targetRInput) : na
+float qty          = contractsFor(stopTicks * syminfo.mintick)
+
+// `not na(stopDistance)`: never send an entry without a stop (ATR is na on the first bars of the chart).
+bool canTrade = inEntryTime and tradesToday < maxTradesInput and strategy.position_size == 0 and qty >= 1 and
+     not na(stopDistance)
+
+// Stop/target distances of the most recently sent entry; they become live once that entry fills.
+var int   plannedStopTicks   = na
+var float plannedTargetTicks = na
+
+// ————— Orders
+// Entry stops are valid for one bar: re-sent while the signal persists, otherwise cancelled.
+if canTrade and longSignal
+    float entryPrice = math.round_to_mintick(close + syminfo.mintick)
+    strategy.entry(ID_LONG, strategy.long, qty = qty, stop = entryPrice,
+         alert_message = "ADX breakout long stop " + str.tostring(entryPrice))
+    strategy.exit(ID_LONG_X, ID_LONG, loss = stopTicks, profit = targetTicks, comment_loss = "SL",
+         comment_profit = "TP")
+    plannedStopTicks   := stopTicks
+    plannedTargetTicks := targetTicks
+else if strategy.position_size == 0
+    strategy.cancel(ID_LONG)
+
+if canTrade and shortSignal and not longSignal
+    float entryPrice = math.round_to_mintick(close - syminfo.mintick)
+    strategy.entry(ID_SHORT, strategy.short, qty = qty, stop = entryPrice,
+         alert_message = "ADX breakout short stop " + str.tostring(entryPrice))
+    strategy.exit(ID_SHORT_X, ID_SHORT, loss = stopTicks, profit = targetTicks, comment_loss = "SL",
+         comment_profit = "TP")
+    plannedStopTicks   := stopTicks
+    plannedTargetTicks := targetTicks
+else if strategy.position_size == 0
+    strategy.cancel(ID_SHORT)
+
+// In a position: keep the bracket working (relative to the actual fill price).
+if strategy.position_size > 0
+    strategy.exit(ID_LONG_X, ID_LONG, loss = plannedStopTicks, profit = plannedTargetTicks, comment_loss = "SL",
+         comment_profit = "TP")
+else if strategy.position_size < 0
+    strategy.exit(ID_SHORT_X, ID_SHORT, loss = plannedStopTicks, profit = plannedTargetTicks, comment_loss = "SL",
+         comment_profit = "TP")
+
+// End-of-day flatten: on the last bar that ends at/before the flatten time, cancel working orders and exit at
+// the next bar's open, so the position is flat by the flatten time on any bar size.
+if flattenNow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "EOD", alert_message = "ADX breakout end-of-day flatten")
+
+// ————— Visuals
+float avgPrice = strategy.position_avg_price
+float stopPlot = strategy.position_size > 0 ? avgPrice - plannedStopTicks * syminfo.mintick :
+     strategy.position_size < 0 ? avgPrice + plannedStopTicks * syminfo.mintick : na
+
+plot(showLevelsInput ? priorHighClose : na, "Breakout level (closing high)", color.new(color.teal, 40), 1, plot.style_stepline)
+plot(showLevelsInput and shortsInput ? priorLowClose : na, "Breakdown level (closing low)", color.new(color.maroon, 40), 1, plot.style_stepline)
+plot(showLevelsInput ? stopPlot : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)
+bgcolor(showLevelsInput and compressed and inEntryTime ? color.new(color.blue, 92) : na, title = "ADX below threshold")

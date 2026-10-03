@@ -1,0 +1,12 @@
+{
+  "name": "intraday-pine-ports-harness",
+  "private": true,
+  "type": "module",
+  "description": "Logic checks for the Pine v6 intraday ports on synthetic data (not a performance backtest).",
+  "scripts": {
+    "test": "node harness.mjs"
+  },
+  "dependencies": {
+    "@heyphat/piner": "0.13.0"
+  }
+}

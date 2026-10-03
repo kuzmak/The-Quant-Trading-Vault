@@ -141,4 +141,41 @@ function rangeOf(bars, date, fromHm, toHm) { let h = -Infinity, l = Infinity;
   console.log('05 ORB Retest (market on confirmation)'); const r2 = await run('05_orb_retest_limit.pine', bars5, '5', { 'Entry': 'Market on confirmation' });
   common('05m', r2.trades, { entryFrom: 575, entryTo: 720, maxPerDay: 1 }); }
 
+
+// ---------- Indicator vs strategy cross-check (script 01) ----------
+// The indicator re-implements the strategy's fills; its entry/exit bars and prices must match the strategy's
+// trade list. Trades piner fills in/out on a single bar are excluded (piner checks the exit against the open).
+{ console.log('01 ORB indicator vs strategy');
+  const all = (await run('01_opening_range_breakout.pine', bars5, '5')).trades;
+  // Drop piner's intrabar-OCA reversals (second leg filled on the first leg's same-bar exit).
+  const real = all.filter((t, i) => !(i > 0 && t.entryBar === all[i-1].exitBar && all[i-1].entryBar === all[i-1].exitBar && t.dir !== all[i-1].dir));
+  const strat = real.filter(t => t.entryBar !== t.exitBar);
+  const sameBar = real.filter(t => t.entryBar === t.exitBar);
+  const compiled = compile(fs.readFileSync(DIR + '01_opening_range_breakout_indicator.pine', 'utf8'));
+  const engine = new Engine(compiled, new ArrayFeed(bars5), {});
+  for (const k of ['NQ@D', 'NQ@1D']) engine.ctx.securityBars.set(k, aggregateDaily(bars5));
+  await engine.run({ symbol: 'NQ', timeframe: '5', mintick: TICK });
+  const plot = title => [...engine.outputs.plots.values()].find(p => p.title === title).data;
+  const entryFill = plot('Entry fill'), exitFill = plot('Exit fill');
+  const entries = entryFill.map((v, i) => [i, v]).filter(([, v]) => Number.isFinite(v));
+  const exits = exitFill.map((v, i) => [i, v]).filter(([, v]) => Number.isFinite(v));
+  const entryAt = new Map(entries), exitAt = new Map(exits);
+  let matched = 0;
+  for (const t of strat) {
+    const e = entryAt.get(t.entryBar), x = exitAt.get(t.exitBar);
+    const ok = e !== undefined && x !== undefined && Math.abs(e - t.entryPrice) < 1e-6 && Math.abs(x - t.exitPrice) < 1e-6;
+    if (ok) matched++;
+    else check('01 indicator matches strategy', false, `${ny(t.entryTime).str} strat ${t.entryPrice}->${t.exitPrice} ind ${e}->${x}`);
+  }
+  let entryOnly = 0;
+  for (const t of sameBar) { const e = entryAt.get(t.entryBar);
+    if (e !== undefined && Math.abs(e - t.entryPrice) < 1e-6) entryOnly++;
+    else check('01 indicator entry matches (same-bar trades)', false, `${ny(t.entryTime).str} strat ${t.entryPrice} ind ${e}`); }
+  check('01 indicator trade count', entries.length === real.length, `${entries.length} vs ${real.length}`);
+  console.log(`   same-bar trades: ${sameBar.length}, entry bar+price matched ${entryOnly} (exits there depend on intrabar path handling)`);
+  console.log(`   indicator: ${entries.length} entries / ${exits.length} exits; strategy (multi-bar trades): ${strat.length}; matched ${matched}`);
+  check('01 indicator one trade/day', new Set(entries.map(([i]) => ny(bars5[i].time).date)).size === entries.length, 'more than one entry on a day');
+  check('01 indicator entries = exits', entries.length === exits.length, `${entries.length} vs ${exits.length}`);
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED` : '\nAll checks passed');

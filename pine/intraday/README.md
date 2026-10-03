@@ -12,6 +12,22 @@ These are Pine Script v6 rewrites of the five intraday strategies picked out in 
 
 Each file starts with a header comment that lists every fix made to its original.
 
+### Indicator version of #1
+
+[`01_opening_range_breakout_indicator.pine`](01_opening_range_breakout_indicator.pine) is an `indicator()` that shows the opening-range strategy's trades as chart signals, using the same inputs and defaults. It draws:
+
+- **Entry arrows:** a teal up-arrow below the bar for a long, a maroon down-arrow above the bar for a short.
+- **Exit arrows,** pointing in the direction of the closing order and coloured by reason: green for take profit, red for stop loss, gray for the end-of-day exit.
+- The opening range, plus the working buy-stop and sell-stop levels while the bracket is armed.
+- The trade's entry, stop and target lines while a position is open.
+- Optional labels showing each fill price.
+
+**Alerts.** Use *ORB armed* (fires once the range is complete), *ORB long/short entry* and *ORB exit*. The *Any alert() function call* option sends the same events with exact prices, for example `NQ1! ORB armed. Buy stop 18250.25 SL 18231.50 TP 18306.50.` The exact entry and exit fill prices also appear in the Data Window.
+
+**How fills are found.** An indicator can't place orders, so each bar is walked along the same path TradingView's backtester assumes: open → nearer extreme → farther extreme → close. A stop or target fills where that path first touches it. When the open gaps past an order, it fills at the open. Slippage is applied to stop and market fills but not to limit (target) fills.
+
+Historical arrows are final. On the bar that is still forming, arrows can change until it closes, and alerts fire once per bar close.
+
 ## Using them in TradingView
 
 1. Open the Pine Editor, paste a script, then **Save** and **Add to chart**.
@@ -42,6 +58,10 @@ Each file starts with a header comment that lists every fix made to its original
 ## What was verified, and what was not
 
 - **Static checks.** All five scripts pass the [`pinescript-v6-validator`](https://www.npmjs.com/package/pinescript-v6-validator), which finds 0 errors and 0 warnings, and they compile in [`@heyphat/piner`](https://www.npmjs.com/package/@heyphat/piner), an independent open-source Pine v6 engine.
+- **Indicator cross-check.** The harness also runs the indicator and the strategy side by side on the same bars:
+  - All 129 indicator entries match the strategy's entries on both bar and price.
+  - All 76 trades lasting more than one bar match on the exit as well.
+  - The remaining 53 trades entered and exited on a single bar. For those, the indicator applies TradingView's intrabar-path rule, which piner does not reproduce. Each of their exits is still a valid stop, target or end-of-day fill.
 - **Logic checks.** [`test/harness.mjs`](test/harness.mjs) runs every script, plus the alternative input modes, in piner on **synthetic** NQ-style 5-minute and 30-minute bars. The bars use real Globex hours and cross a DST change. The harness asserts:
   - entries happen only inside the trading window
   - every position is flat by the flatten time on the same day

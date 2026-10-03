@@ -1,0 +1,349 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Indicator version of 01_opening_range_breakout.pine (CME index futures: NQ / ES / RTY / YM and micros).
+//
+// Draws the opening range and arrows where the strategy would enter and exit, with the same rules and
+// defaults: bracketed stop entries one tick beyond the 09:30-09:45 ET range until 12:00, stop at the range
+// midpoint (or opposite side), 3R target, one trade per day, flat at 15:55 ET.
+//
+// How fills are found: an indicator cannot use `strategy.*`, so each bar is walked along the same intrabar
+// path TradingView's broker emulator assumes (open -> nearer extreme -> farther extreme -> close). Entries,
+// stops and targets fill where that path first touches them; gaps fill at the open; stop and market fills
+// include the configured slippage, limit (target) fills do not.
+//
+// Repainting: historical marks are final. On the live bar, marks can change until the bar closes (the
+// intrabar path is only known once the bar is complete). Alerts fire once per bar close.
+
+//@version=6
+indicator("Opening Range Breakout Signals [CME index futures]", shorttitle = "ORB Signals", overlay = true,
+     max_labels_count = 500)
+
+// ————— Constants
+const string TZ          = "America/New_York"
+const int    MS_IN_MIN   = 60 * 1000
+const string STOP_MID    = "Range midpoint"
+const string STOP_OPP    = "Opposite side of range"
+const string EXIT_TP     = "TP"
+const string EXIT_SL     = "SL"
+const string EXIT_EOD    = "EOD"
+const color  LONG_COLOR  = color.teal
+const color  SHORT_COLOR = color.maroon
+const color  TP_COLOR    = color.green
+const color  SL_COLOR    = color.red
+const color  EOD_COLOR   = color.gray
+
+const string GRP_SESSION = "Session (New York time)"
+const string GRP_DAYS    = "Trading days"
+const string GRP_SIGNAL  = "Entries & exits"
+const string GRP_FILTER  = "Range filter"
+const string GRP_VISUAL  = "Visuals"
+
+const string TT_STOP   = "Range midpoint = original rule (stop at half the range). Opposite side = wider, classic ORB stop."
+const string TT_TARGET = "Take-profit as a multiple of the initial risk (entry to stop). 0 disables the target; the trade then exits at the stop or the end-of-day flatten."
+const string TT_ATR    = "Only signal when the opening range is between the min and max fraction of the prior days' daily ATR."
+const string TT_SLIP   = "Ticks added against you on stop entries, stop-loss exits and the end-of-day exit (match the strategy's slippage setting). Targets are limit orders and fill at their price."
+const string TT_LABELS = "Adds a label at each fill with the side or exit reason and the fill price."
+const string TT_COLORS = "Exit arrow colours: green = take profit, red = stop loss, gray = end-of-day flatten."
+
+// ————— Inputs (same names and defaults as the strategy)
+int    orStartHourInput    = input.int(9,  "Range start",        minval = 0, maxval = 23, inline = "or",   group = GRP_SESSION)
+int    orStartMinuteInput  = input.int(30, ":",                  minval = 0, maxval = 59, inline = "or",   group = GRP_SESSION)
+int    orMinutesInput      = input.int(15, "Range length (min)", minval = 1, maxval = 240,                 group = GRP_SESSION)
+int    entryEndHourInput   = input.int(12, "Last entry",         minval = 0, maxval = 23, inline = "ee",   group = GRP_SESSION)
+int    entryEndMinuteInput = input.int(0,  ":",                  minval = 0, maxval = 59, inline = "ee",   group = GRP_SESSION)
+int    flatHourInput       = input.int(15, "Flatten at",         minval = 0, maxval = 23, inline = "flat", group = GRP_SESSION)
+int    flatMinuteInput     = input.int(55, ":",                  minval = 0, maxval = 59, inline = "flat", group = GRP_SESSION)
+
+bool   monInput            = input.bool(true, "Mon", inline = "days", group = GRP_DAYS)
+bool   tueInput            = input.bool(true, "Tue", inline = "days", group = GRP_DAYS)
+bool   wedInput            = input.bool(true, "Wed", inline = "days", group = GRP_DAYS)
+bool   thuInput            = input.bool(true, "Thu", inline = "days", group = GRP_DAYS)
+bool   friInput            = input.bool(true, "Fri", inline = "days", group = GRP_DAYS)
+
+bool   longsInput          = input.bool(true, "Longs",  inline = "dir", group = GRP_SIGNAL)
+bool   shortsInput         = input.bool(true, "Shorts", inline = "dir", group = GRP_SIGNAL)
+int    entryOffsetInput    = input.int(1, "Entry offset beyond range (ticks)", minval = 0, group = GRP_SIGNAL)
+string stopModeInput       = input.string(STOP_MID, "Stop", options = [STOP_MID, STOP_OPP], tooltip = TT_STOP, group = GRP_SIGNAL)
+float  targetRInput        = input.float(3.0, "Target (R multiple)", minval = 0.0, step = 0.25, tooltip = TT_TARGET, group = GRP_SIGNAL)
+int    slippageInput       = input.int(1, "Slippage (ticks)", minval = 0, tooltip = TT_SLIP, group = GRP_SIGNAL)
+
+bool   atrFilterInput      = input.bool(false, "Filter range size vs daily ATR", tooltip = TT_ATR, group = GRP_FILTER)
+int    atrLengthInput      = input.int(14, "Daily ATR length", minval = 1, group = GRP_FILTER)
+float  minRangeAtrInput    = input.float(0.10, "Min range / ATR", minval = 0.0, step = 0.05, inline = "atr", group = GRP_FILTER)
+float  maxRangeAtrInput    = input.float(0.60, "Max",             minval = 0.0, step = 0.05, inline = "atr", group = GRP_FILTER)
+
+bool   showRangeInput      = input.bool(true,  "Show opening range",        group = GRP_VISUAL)
+bool   showLevelsInput     = input.bool(true,  "Show entry, stop and target levels", group = GRP_VISUAL)
+bool   showLabelsInput     = input.bool(false, "Show fill-price labels", tooltip = TT_LABELS, group = GRP_VISUAL)
+bool   showLegendInput     = input.bool(true,  "Show exit colour legend", tooltip = TT_COLORS, group = GRP_VISUAL)
+
+// ————— Functions
+//@function Returns the UNIX time of `hh:mm` New York time on the current bar's New York calendar date.
+//@param hh (simple int) Hour, 0-23.
+//@param mm (simple int) Minute, 0-59.
+//@returns (int) Timestamp in milliseconds.
+todayAt(simple int hh, simple int mm) =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), hh, mm, 0)
+
+//@function Whether `level` lies on the price segment from `a` to `b` (inclusive).
+//@param level (float) Price level to test.
+//@param a (float) Segment start price.
+//@param b (float) Segment end price.
+//@returns (bool) True when the segment touches the level.
+touches(float level, float a, float b) =>
+    not na(level) and level >= math.min(a, b) and level <= math.max(a, b)
+
+// ————— Guards
+if barstate.isfirst
+    if not timeframe.isintraday
+        runtime.error("Use an intraday chart (1-5 minute bars recommended).")
+    if timeframe.in_seconds() > orMinutesInput * 60
+        runtime.error("The chart timeframe must not be longer than the opening-range length.")
+
+// ————— Session clock
+int  orStartTs    = todayAt(orStartHourInput, orStartMinuteInput)
+int  orEndTs      = orStartTs + orMinutesInput * MS_IN_MIN
+int  entryEndTs   = todayAt(entryEndHourInput, entryEndMinuteInput)
+int  flatTs       = todayAt(flatHourInput, flatMinuteInput)
+int  barMs        = timeframe.in_seconds() * 1000
+// True from the last bar that ends at/before the flatten time: the next bar would end after it.
+bool flattenNow   = time_close + barMs > flatTs
+bool isOrBar      = time >= orStartTs and time < orEndTs
+bool isOrFirstBar = isOrBar and (na(time[1]) or time[1] < orStartTs)
+bool isOrLastBar  = isOrBar and time_close >= orEndTs
+// Orders "sent" on a bar's close work from the next bar, so arming starts on the last range bar.
+bool inEntryTime  = time_close >= orEndTs and time_close < entryEndTs and not flattenNow
+
+bool dayAllowed = switch dayofweek(time, TZ)
+    dayofweek.monday    => monInput
+    dayofweek.tuesday   => tueInput
+    dayofweek.wednesday => wedInput
+    dayofweek.thursday  => thuInput
+    dayofweek.friday    => friInput
+    =>                     false
+
+// Prior completed days' ATR: `[1]` + lookahead_on is the non-repainting HTF idiom.
+float dailyAtr = request.security(syminfo.tickerid, "D", ta.atr(atrLengthInput)[1], lookahead = barmerge.lookahead_on)
+
+float tick = syminfo.mintick
+float slip = slippageInput * tick
+
+// ————— Simulated position and working orders (state carried from the previous bar's close)
+var int   pos            = 0       // simulated position: +1 long, -1 short, 0 flat
+var float entryPrice     = na      // actual fill price of the open trade
+var float stopPrice      = na
+var float targetPrice    = na
+var bool  armedLong      = false   // buy-stop working during this bar
+var bool  armedShort     = false   // sell-stop working during this bar
+var float armLongEntry   = na
+var float armLongStop    = na
+var float armLongTarget  = na
+var float armShortEntry  = na
+var float armShortStop   = na
+var float armShortTarget = na
+var bool  flattenPending = false   // end-of-day market exit at this bar's open
+
+// Events on this bar (for arrows and alerts).
+int    entryDir   = 0
+float  entryFill  = na
+float  entryStop  = na      // the new trade's stop/target, kept for alerts even if it also exits this bar
+float  entryTgt   = na
+int    exitDir    = 0
+float  exitFill   = na
+string exitReason = ""
+
+// 1) End-of-day exit decided on the previous bar fills at this bar's open.
+if flattenPending and pos != 0
+    exitDir    := pos
+    exitFill   := open - pos * slip
+    exitReason := EXIT_EOD
+    pos        := 0
+flattenPending := false
+
+// 2) Walk the intrabar path and fill whatever it touches, in order.
+if pos != 0 or armedLong or armedShort
+    // Gaps: a working stop already through at the open fills at the open.
+    if pos == 0 and armedLong and open >= armLongEntry
+        entryDir  := 1
+        entryFill := open + slip
+    else if pos == 0 and armedShort and open <= armShortEntry
+        entryDir  := -1
+        entryFill := open - slip
+
+    // Path: open -> nearer extreme -> farther extreme -> close (TradingView's broker-emulator assumption).
+    bool    highFirst = high - open <= open - low
+    float[] path      = array.from(open, highFirst ? high : low, highFirst ? low : high, close)
+    for i = 0 to 2
+        float a      = path.get(i)
+        float b      = path.get(i + 1)
+        bool  rising = b > a
+        // Entry: only while flat and before any fill on this bar. The first stop touched wins (OCA).
+        if pos == 0 and entryDir == 0 and exitDir == 0
+            if rising and armedLong and touches(armLongEntry, a, b)
+                entryDir  := 1
+                entryFill := armLongEntry + slip
+                a         := armLongEntry
+            else if not rising and armedShort and touches(armShortEntry, a, b)
+                entryDir  := -1
+                entryFill := armShortEntry - slip
+                a         := armShortEntry
+        if pos == 0 and entryDir != 0 and exitDir == 0
+            pos         := entryDir
+            entryPrice  := entryFill
+            stopPrice   := entryDir == 1 ? armLongStop : armShortStop
+            targetPrice := entryDir == 1 ? armLongTarget : armShortTarget
+            entryStop   := stopPrice
+            entryTgt    := targetPrice
+            armedLong   := false
+            armedShort  := false
+            // Bracket orders already crossed by the entry fill price (only possible on a gap) fill there.
+            if (entryDir == 1 and a <= stopPrice) or (entryDir == -1 and a >= stopPrice)
+                exitDir    := entryDir
+                exitFill   := a - entryDir * slip
+                exitReason := EXIT_SL
+                pos        := 0
+        // Exits for the open position along the rest of this segment.
+        if pos == 1
+            if rising and touches(targetPrice, a, b)
+                exitDir    := 1
+                exitFill   := targetPrice
+                exitReason := EXIT_TP
+                pos        := 0
+            else if not rising and touches(stopPrice, a, b)
+                exitDir    := 1
+                exitFill   := stopPrice - slip
+                exitReason := EXIT_SL
+                pos        := 0
+        else if pos == -1
+            if not rising and touches(targetPrice, a, b)
+                exitDir    := -1
+                exitFill   := targetPrice
+                exitReason := EXIT_TP
+                pos        := 0
+            else if rising and touches(stopPrice, a, b)
+                exitDir    := -1
+                exitFill   := stopPrice + slip
+                exitReason := EXIT_SL
+                pos        := 0
+
+if pos == 0
+    entryPrice  := na
+    stopPrice   := na
+    targetPrice := na
+
+// ————— Opening range (updated at the bar's close, as in the strategy)
+var float orHigh     = na
+var float orLow      = na
+var int   rangeDayTs = na      // `orStartTs` of the day whose range is complete
+var bool  tradedDay  = false   // one trade per day
+
+if isOrFirstBar
+    orHigh    := high
+    orLow     := low
+    tradedDay := false
+else if isOrBar and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+if isOrLastBar and not na(orHigh)
+    rangeDayTs := orStartTs
+
+if entryDir != 0
+    tradedDay := true
+
+bool  rangeReady = not na(rangeDayTs) and rangeDayTs == orStartTs
+float orRange    = orHigh - orLow
+float orMid      = math.round_to_mintick((orHigh + orLow) / 2)
+
+// ————— Levels and arming for the next bar
+float longEntry   = math.round_to_mintick(orHigh + entryOffsetInput * tick)
+float shortEntry  = math.round_to_mintick(orLow - entryOffsetInput * tick)
+float longStop    = stopModeInput == STOP_MID ? orMid : orLow
+float shortStop   = stopModeInput == STOP_MID ? orMid : orHigh
+float longTarget  = targetRInput > 0 ? math.round_to_mintick(longEntry + targetRInput * (longEntry - longStop)) : na
+float shortTarget = targetRInput > 0 ? math.round_to_mintick(shortEntry - targetRInput * (shortStop - shortEntry)) : na
+
+bool atrOk = not atrFilterInput or
+     (not na(dailyAtr) and orRange >= minRangeAtrInput * dailyAtr and orRange <= maxRangeAtrInput * dailyAtr)
+
+bool canArm      = rangeReady and inEntryTime and dayAllowed and atrOk and not tradedDay and orRange > 0 and
+     pos == 0
+bool wasArmed    = armedLong or armedShort
+armedLong       := canArm and longsInput
+armedShort      := canArm and shortsInput
+bool justArmed   = (armedLong or armedShort) and not wasArmed and entryDir == 0 and exitDir == 0
+armLongEntry    := longEntry
+armLongStop     := longStop
+armLongTarget   := longTarget
+armShortEntry   := shortEntry
+armShortStop    := shortStop
+armShortTarget  := shortTarget
+
+// End-of-day: exit at the next bar's open and stop arming.
+if flattenNow
+    armedLong  := false
+    armedShort := false
+    if pos != 0
+        flattenPending := true
+
+// ————— Visuals
+bool  showRange = showRangeInput and (isOrBar or rangeReady) and time < flatTs
+color exitColor = exitReason == EXIT_TP ? TP_COLOR : exitReason == EXIT_SL ? SL_COLOR : EOD_COLOR
+
+plot(showRange ? orHigh : na, "Range high", color.new(LONG_COLOR, 0),  2, plot.style_linebr)
+plot(showRange ? orLow : na,  "Range low",  color.new(SHORT_COLOR, 0), 2, plot.style_linebr)
+bgcolor(showRangeInput and isOrBar ? color.new(color.gray, 85) : na, title = "Opening range window")
+
+// Working buy/sell stops while armed, then the trade's entry/stop/target while in a position.
+plot(showLevelsInput and armedLong ? armLongEntry : na,   "Buy stop",  color.new(LONG_COLOR, 50),  1, plot.style_circles)
+plot(showLevelsInput and armedShort ? armShortEntry : na, "Sell stop", color.new(SHORT_COLOR, 50), 1, plot.style_circles)
+plot(showLevelsInput ? entryPrice : na,  "Entry",  color.new(color.blue, 0), 1, plot.style_linebr)
+plot(showLevelsInput ? stopPrice : na,   "Stop",   color.new(SL_COLOR, 0),   1, plot.style_linebr)
+plot(showLevelsInput ? targetPrice : na, "Target", color.new(TP_COLOR, 0),   1, plot.style_linebr)
+
+// Arrows: entries point in the trade direction; exits point in the closing order's direction, coloured by reason.
+plotshape(entryDir == 1,  "Long entry",  shape.arrowup,   location.belowbar, LONG_COLOR,  text = "Long",  size = size.normal)
+plotshape(entryDir == -1, "Short entry", shape.arrowdown, location.abovebar, SHORT_COLOR, text = "Short", size = size.normal)
+plotshape(exitDir == 1,   "Long exit",   shape.arrowdown, location.abovebar, exitColor,   text = "Exit",  size = size.normal)
+plotshape(exitDir == -1,  "Short exit",  shape.arrowup,   location.belowbar, exitColor,   text = "Exit",  size = size.normal)
+
+// Exact fill prices in the Data Window (hover a bar).
+plot(entryFill, "Entry fill", color.new(color.blue, 0), display = display.data_window)
+plot(exitFill,  "Exit fill",  exitColor,                display = display.data_window)
+
+if showLabelsInput and entryDir != 0
+    label.new(bar_index, entryFill, (entryDir == 1 ? "Long " : "Short ") + str.tostring(entryFill, format.mintick),
+         style = label.style_label_left, color = color.new(entryDir == 1 ? LONG_COLOR : SHORT_COLOR, 20),
+         textcolor = color.white, size = size.small)
+if showLabelsInput and exitDir != 0
+    label.new(bar_index, exitFill, exitReason + " " + str.tostring(exitFill, format.mintick),
+         style = label.style_label_left, color = color.new(exitColor, 20), textcolor = color.white, size = size.small)
+
+if showLegendInput and barstate.islast
+    var table legend = table.new(position.bottom_right, 1, 3, bgcolor = color.new(color.black, 80))
+    legend.cell(0, 0, "Exit: take profit", text_color = TP_COLOR, text_size = size.small)
+    legend.cell(0, 1, "Exit: stop loss",   text_color = SL_COLOR, text_size = size.small)
+    legend.cell(0, 2, "Exit: end of day",  text_color = EOD_COLOR, text_size = size.small)
+
+// ————— Alerts
+alertcondition(justArmed,    "ORB armed",       "ORB range complete: bracket armed for {{ticker}}")
+alertcondition(entryDir == 1,  "ORB long entry",  "ORB long entry on {{ticker}} at {{close}}")
+alertcondition(entryDir == -1, "ORB short entry", "ORB short entry on {{ticker}} at {{close}}")
+alertcondition(exitDir != 0,   "ORB exit",        "ORB exit on {{ticker}} at {{close}}")
+
+// Dynamic messages with exact levels for "Any alert() function call" alerts.
+if justArmed
+    string msg = syminfo.ticker + " ORB armed."
+    if armedLong
+        msg += " Buy stop " + str.tostring(armLongEntry, format.mintick) + " SL " + str.tostring(armLongStop, format.mintick) +
+             (na(armLongTarget) ? "" : " TP " + str.tostring(armLongTarget, format.mintick)) + "."
+    if armedShort
+        msg += " Sell stop " + str.tostring(armShortEntry, format.mintick) + " SL " + str.tostring(armShortStop, format.mintick) +
+             (na(armShortTarget) ? "" : " TP " + str.tostring(armShortTarget, format.mintick)) + "."
+    alert(msg, alert.freq_once_per_bar_close)
+if entryDir != 0
+    alert(syminfo.ticker + " ORB " + (entryDir == 1 ? "LONG" : "SHORT") + " entry " + str.tostring(entryFill, format.mintick) +
+         " SL " + str.tostring(entryStop, format.mintick) +
+         (na(entryTgt) ? "" : " TP " + str.tostring(entryTgt, format.mintick)), alert.freq_once_per_bar_close)
+if exitDir != 0
+    alert(syminfo.ticker + " ORB exit (" + exitReason + ") " + str.tostring(exitFill, format.mintick),
+         alert.freq_once_per_bar_close)
